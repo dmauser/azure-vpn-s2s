@@ -1,0 +1,242 @@
+#Prereq
+az extension add --name azure-firewall
+
+#Azure Variables
+rg=lab-er-vpn-s2s-Internet #Define your resource group
+location=southcentralus #Set Region
+mypip=$(curl -4 ifconfig.io -s) #Captures your local Public IP and adds it to NSG to restrict access to SSH only for your Public IP.
+sharedkey=$(openssl rand -base64 24) #VPN Gateways S2S shared key is automatically generated.
+username=azureuser
+password=Msft123Msft12
+
+#Define parameters for Azure Hub and Spokes:
+AzurehubName=Az-Hub #Azure Hub Name
+AzurehubaddressSpacePrefix=10.0.20.0/24 #Azure Hub VNET address space
+AzurehubNamesubnetName=subnet1 #Azure Hub Subnet name where VM will be provisioned
+Azurehubsubnet1Prefix=10.0.20.0/27 #Azure Hub Subnet address prefix
+AzurehubgatewaySubnetPrefix=10.0.20.32/27 #Azure Hub Gateway Subnet address prefix
+AzureFirewallPrefix=10.0.20.64/26 #Azure Firewall Prefix
+AzurehubrssubnetPrefix=10.0.20.128/27 #Azure Hub Route Server subnet address prefix
+AzureHubDnsInSubnetPrefix=10.0.20.160/28
+AzureHubDnsOutSubnetPrefix=10.0.20.176/28
+AzureHubBastionSubnet=10.0.20.192/26
+Azurespoke1Name=az-spk1 #Azure Spoke 1 name
+Azurespoke1AddressSpacePrefix=10.0.21.0/24 # Azure Spoke 1 VNET address space
+Azurespoke1Subnet1Prefix=10.0.21.0/27 # Azure Spoke 1 Subnet1 address prefix
+Azurespoke2Name=az-spk2 #Azure Spoke 1 name
+Azurespoke2AddressSpacePrefix=10.0.22.0/24 # Azure Spoke 1 VNET address space
+Azurespoke2Subnet1Prefix=10.0.22.0/27 # Azure Spoke 1 VNET address space
+
+#Parsing parameters above in Json format (do not change)
+JsonAzure={\"hubName\":\"$AzurehubName\",\"addressSpacePrefix\":\"$AzurehubaddressSpacePrefix\",\"subnetName\":\"$AzurehubNamesubnetName\",\"subnet1Prefix\":\"$Azurehubsubnet1Prefix\",\"AzureFirewallPrefix\":\"$AzureFirewallPrefix\",\"gatewaySubnetPrefix\":\"$AzurehubgatewaySubnetPrefix\",\"rssubnetPrefix\":\"$AzurehubrssubnetPrefix\",\"bastionSubnetPrefix\":\"$AzureHubBastionSubnet\",\"spoke1Name\":\"$Azurespoke1Name\",\"spoke1AddressSpacePrefix\":\"$Azurespoke1AddressSpacePrefix\",\"spoke1Subnet1Prefix\":\"$Azurespoke1Subnet1Prefix\",\"spoke2Name\":\"$Azurespoke2Name\",\"spoke2AddressSpacePrefix\":\"$Azurespoke2AddressSpacePrefix\",\"spoke2Subnet1Prefix\":\"$Azurespoke2Subnet1Prefix\"}
+
+#Deploy base lab environment = Hub + VPN Gateway + VM and two Spokes with one VM on each.
+echo Deploying base lab: Hub with Spoke1 and 2, On-Premises and VPN using VNGs with BGP.
+echo "*** It will take around 30 minutes to finish the deployment ***"
+az group create --name $rg --location $location --output none
+az deployment group create --name lab-$RANDOM --resource-group $rg \
+--template-uri https://raw.githubusercontent.com/dmauser/azure-vpn-s2s/main/vpn-er-ibo/template/azurehubspoke.json \
+--parameters deployHubVPNGateway=true deployOnpremisesVPNGateway=true enableBgp=true gatewaySku=VpnGw1 vpnGatewayGeneration=Generation1 Restrict_SSH_VM_AccessByPublicIP=$mypip sharedKey=$sharedkey deployHubERGateway=true Onprem=$JsonOnPrem Azure=$JsonAzure VmAdminUsername=$username VmAdminPassword=$password \
+--no-wait
+
+#Enable boot diagnostics for all VMs in the resource group (Serial console)
+let "randomIdentifier=$RANDOM*$RANDOM" #used to create unique storage account name.
+#Create Storage Account (boot diagnostics + serial console)
+az storage account create -n sc$randomIdentifier -g $rg -l $location --sku Standard_LRS -o none
+#Enable boot diagnostics
+stguri=$(az storage account show -n sc$randomIdentifier -g $rg --query primaryEndpoints.blob -o tsv)
+az vm boot-diagnostics enable --storage $stguri --ids $(az vm list -g $rg --query "[].id" -o tsv) -o none
+
+### Installing tools for networking connectivity validation such as traceroute, tcptraceroute, iperf and others (check link below for more details) 
+echo Installing tools for networking connectivity validation such as traceroute, tcptraceroute, iperf and others  
+nettoolsuri="https://raw.githubusercontent.com/dmauser/azure-vm-net-tools/main/script/nettools.sh"
+for vm in `az vm list -g $rg --query "[?storageProfile.imageReference.offer=='UbuntuServer'].name" -o tsv`
+do
+ az vm extension set \
+ --resource-group $rg \
+ --vm-name $vm \
+ --name customScript \
+ --publisher Microsoft.Azure.Extensions \
+ --protected-settings "{\"fileUris\": [\"$nettoolsuri\"],\"commandToExecute\": \"./nettools.sh\"}" \
+ --no-wait
+done
+
+
+# Deploy OPNsense NVA1 remote
+az deployment group create --name $remoten-nva-$RANDOM --resource-group $rg \
+--template-uri "https://raw.githubusercontent.com/dmauser/opnazure/master/ARM/main-two-nics.json" \
+--parameters virtualMachineSize=Standard_B2s virtualMachineName=remote-nva TempUsername=$username TempPassword=$password existingVirtualNetworkName=new VNETAddress=["10.101.0.0/24"] untrustedSubnetCIDR="10.101.0.0/27" trustedSubnetCIDR="10.101.0.32/27" existingUntrustedSubnet=untrusted existingTrustedSubnet=trusted PublicIPAddressSku=Standard \
+--no-wait
+
+# ExpressRoute Circuit
+az deployment group create \
+--resource-group $rg \
+--template-uri https://raw.githubusercontent.com/dmauser/azure-hub-spoke-base-lab/main/linked/ercircuit.json \
+--parameters ercircuitname=er-lab-onprem asn=65154 primaryPeerAddressPrefix=172.100.154.0/30 secondaryPeerAddressPrefix=172.100.154.4/30 provider=Megaport peeringlocation="Dallas" bandwidthInMbps=50 \
+--no-wait
+
+#Connect both ER Circuit to Hub ExpressRoute Gateway
+
+erid=$(az network express-route show -n er-lab-onprem -g $rg --query id -o tsv) 
+az network vpn-connection create --name connection-to-onprem \
+--resource-group $rg --vnet-gateway1 $AzurehubName-ergw \
+--express-route-circuit2 $erid \
+--routing-weight 0
+
+# Create Local Network Gateway with OnPrem info
+onpremname=remote-opn
+onpremasn=65101
+onprembgpaddr=169.254.0.1
+az network local-gateway create --gateway-ip-address $(az network public-ip show --name opnnva-PublicIP --resource-group $rg -o tsv --query "ipAddress" -o tsv) \
+--name $AzurehubName-lng-$onpremname \
+--resource-group $rg \
+--asn $onpremasn \
+--bgp-peering-address $onprembgpaddr \
+--output none
+
+#Creat VPN Connections
+# Create VPN Gateway connection to On-Premises
+az network vpn-connection create --name azhub-to-$onpremname \
+--resource-group $rg \
+--vnet-gateway1 Az-Hub-vpngw \
+-l $location \
+--shared-key $sharedkey \
+--local-gateway2 $AzurehubName-lng-$onpremname \
+--enable-bgp \
+--output none
+
+# OPNSense Instruction
+# Login/password: root/opnsense (change default password)
+# Add os-frr plugin (System - Firmware - Plugin)
+# Configure IPSec VPN (VPN: IPsec: Tunnel Settings)
+# Add Phase1 - Remote gateway: (VPN Gateway Public IP) / My identifier: (Public IP of the OPNSense) / Pre-Shared Key /  Encryption algorithm: AES 256 / DH Key Group: 2 / Advanced Options: Install Policy uncheck (VERY IMPORTANT) 
+az network vnet-gateway show -n $AzurehubName-vpngw -g $rg  --query bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses -o tsv #VPN Gateway Public IP
+az network public-ip show --name opnnva-PublicIP --resource-group $rg -o tsv --query "ipAddress" -o tsv #OPNSense Public IP
+echo $sharedkey 
+# Add Phase 2 - Mode: Route-based / Local Address: 169.254.0.1 / Remote Address: 169.254.21.1 / Encryption algorithm: AES 256
+# Enable IPSec checkbox and Apply Changes
+# Firewall: Rules:  / Add rule (Plus) / Save / Apply Changes
+# Routing: General / Enable checked / Save
+# Routing: BGP / General tab / enable checked / BGP AS Number 65101
+# Routing: BGP / Neighbors tab / Add / Peer-IP 169.254.21.1 / Remote AS 65515 / Send Defaultroute
+# Routing: BGP / General tab / Save
+# Firewall: NAT: Outbound / Add rule (Plus) / Save / Apply Changes
+
+### Add Azure Firewall:
+
+#Build Azure Firewall / Note this section takes few minutes to complete.
+az network public-ip create --name $AzurehubName-azfw-pip --resource-group $rg --location $location --allocation-method static --sku standard
+az network firewall create --name $AzurehubName-azfw --resource-group $rg --location $location
+az network firewall ip-config create --firewall-name $AzurehubName-azfw --name FW-config --public-ip-address $AzurehubName-azfw-pip  --resource-group $rg --vnet-name $AzurehubName-vnet
+az network firewall update --name $AzurehubName-azfw --resource-group $rg 
+
+#Create firewall rule to allow all traffic
+az network firewall network-rule create --resource-group $rg \
+--firewall-name $AzurehubName-azfw \
+--collection-name azfw-rules \
+--priority 1000 \
+--action Allow \
+--name Allow-All \
+--protocols Any \
+--source-addresses "*" \
+--destination-addresses "*" \
+--destination-ports "*"
+
+#Create Log Analytics Workspace
+Workspacename=$AzurehubName-Firewall-Logs 
+az monitor log-analytics workspace create -g $rg --workspace-name $Workspacename --location $location --no-wait
+
+#Enable Azure Firewall diagnostics
+az monitor diagnostic-settings create -n 'toLogAnalytics' \
+--resource $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query id -o tsv) \
+--workspace $(az monitor log-analytics workspace show -g $rg --workspace-name $Workspacename --query id -o tsv) \
+--logs '[{"category":"AzureFirewallApplicationRule","Enabled":true}, {"category":"AzureFirewallNetworkRule","Enabled":true}, {"category":"AzureFirewallDnsProxy","Enabled":true}]' \
+--metrics '[{"category": "AllMetrics","enabled": true}]'
+
+#UDR for Hub traffic to Azure Firewall (disables BGP propagation)
+## Create UDR + Disable BGP Propagation
+az network route-table create --name RT-Hub-to-AzFW --resource-group $rg --location $location --disable-bgp-route-propagation true
+## Default route to AzFW
+az network route-table route create --resource-group $rg --name Default-to-AzFw --route-table-name RT-Hub-to-AzFW  \
+--address-prefix 0.0.0.0/0 \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Traffic to Spoke1 via AzFW
+az network route-table route create --resource-group $rg --name Spk1-to-AzFw --route-table-name RT-Hub-to-AzFW  \
+--address-prefix $Azurespoke1AddressSpacePrefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Traffic to Spoke2 via AzFW
+az network route-table route create --resource-group $rg --name Spk2-to-AzFw --route-table-name RT-Hub-to-AzFW  \
+--address-prefix $Azurespoke2AddressSpacePrefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+mypip=$(curl ifconfig.io -s) #adding Public IP allow access to the VMs after enable UDR.
+az network route-table route create --resource-group $rg --name Exception --route-table-name RT-Hub-to-AzFW  \
+--address-prefix $mypip/32 \
+--next-hop-type Internet
+## Associating RT-Hub-to-AzFW Hub Subnet1 
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $AzurehubName-vnet --route-table RT-Hub-to-AzFW 
+
+# Spoke 1 and 2 traffic to Firewall
+## Create UDR + Disable BGP Propagation
+az network route-table create --name RT-Spoke-to-AzFW  --resource-group $rg --location $location --disable-bgp-route-propagation true
+## Default route to AzFW
+az network route-table route create --resource-group $rg --name Default-to-AzFw --route-table-name RT-Spoke-to-AzFW   \
+--address-prefix 0.0.0.0/0 \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Traffic to Hub to AzFW
+az network route-table route create --resource-group $rg --name Hub-to-AzFw --route-table-name RT-Spoke-to-AzFW   \
+--address-prefix $AzurehubaddressSpacePrefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Remote Public IP exception to remote SSH 
+mypip=$(curl ifconfig.io -s) #adding Public IP allow access to the VMs after enable UDR.
+az network route-table route create --resource-group $rg --name Exception --route-table-name RT-Spoke-to-AzFW   \
+--address-prefix $mypip/32 \
+--next-hop-type Internet
+
+## Associated RT-Hub-to-AzFW to Spoke 1 and 2.
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke1Name-vnet --route-table RT-Spoke-to-AzFW
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke2Name-vnet --route-table RT-Spoke-to-AzFW
+
+#UDR to send traffic between ExpressRoute environment and VPN Onprem and between Hub and spoke via Azure Firewall
+az network route-table create --name RT-GWSubnet-to-AzFW --resource-group $rg --location $location 
+## Azure Hub Subnet 1
+az network route-table route create --resource-group $rg --name HubSubnet1-to-AzFw --route-table-name RT-GWSubnet-to-AzFW \
+--address-prefix $Azurehubsubnet1Prefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Azure Spoke 1
+az network route-table route create --resource-group $rg --name Spoke1-to-AzFw --route-table-name RT-GWSubnet-to-AzFW \
+--address-prefix $Azurespoke1AddressSpacePrefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Azure Spoke 2
+az network route-table route create --resource-group $rg --name Spok2-to-AzFw --route-table-name RT-GWSubnet-to-AzFW \
+--address-prefix $Azurespoke2AddressSpacePrefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Associating RT-to-GWSubnet to GatewaySubnet
+az network vnet subnet update -n GatewaySubnet -g $rg --vnet-name $AzurehubName-vnet --route-table RT-GWSubnet-to-AzFW
+
+# AzureFireawll Subnet -> Default route - NextHop Internet
+az network route-table create --name RT-AzFW-to-Internet  --resource-group $rg --location $location --disable-bgp-route-propagation false
+## Default route to AzFW
+az network route-table route create --resource-group $rg --name Default-to-AzFw --route-table-name RT-AzFW-to-Internet   \
+--address-prefix 0.0.0.0/0 \
+--next-hop-type Internet 
+az network vnet subnet update -n AzureFirewallSubnet -g $rg --vnet-name $AzurehubName-vnet --route-table RT-AzFW-to-Internet
+
+# Misc/Troubleshooting
+# Disable UDRs ## Disable Route Tables (bypass Firewall) - It restores default behavior of the original LAB without the Firewall.
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $AzurehubName-vnet --route-table "" -o none
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke1Name-vnet --route-table "" -o none
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke2Name-vnet --route-table "" -o none
+az network vnet subnet update -n GatewaySubnet -g $rg --vnet-name $AzurehubName-vnet --route-table "" -o none
+
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $AzurehubName-vnet --route-table RT-Hub-to-AzFW -o none
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke1Name-vnet --route-table RT-Spoke-to-AzFW -o none
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke2Name-vnet --route-table RT-Spoke-to-AzFW -o none
+az network vnet subnet update -n GatewaySubnet -g $rg --vnet-name $AzurehubName-vnet --route-table RT-GWSubnet-to-AzFW -o none
