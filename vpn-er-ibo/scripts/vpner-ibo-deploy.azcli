@@ -24,6 +24,15 @@ Azurespoke2Name=Az-Spk2 #Azure Spoke 1 name
 Azurespoke2AddressSpacePrefix=10.0.22.0/24 # Azure Spoke 1 VNET address space
 Azurespoke2Subnet1Prefix=10.0.22.0/27 # Azure Spoke 1 VNET address space
 
+### VPN-VNET for Internet breakout
+AzurevpngwName=az-vpn #Azure Spoke 1 name
+AzurevpngwAddressSpacePrefix=10.0.23.0/24 
+Azurevpngw2Subnet1Prefix=10.0.23.0/27 
+AzurehubgatewaySubnetPrefix=10.0.23.32/27
+vnetname=$AzurevpngwName-vnet 
+subnetname=subnet1
+nvaname=$AzurevpngwName-nva-lx
+
 #Parsing parameters above in Json format (do not change)
 JsonAzure={\"hubName\":\"$AzurehubName\",\"addressSpacePrefix\":\"$AzurehubaddressSpacePrefix\",\"subnetName\":\"$AzurehubNamesubnetName\",\"subnet1Prefix\":\"$Azurehubsubnet1Prefix\",\"AzureFirewallPrefix\":\"$AzureFirewallPrefix\",\"gatewaySubnetPrefix\":\"$AzurehubgatewaySubnetPrefix\",\"rssubnetPrefix\":\"$AzurehubrssubnetPrefix\",\"bastionSubnetPrefix\":\"$AzureHubBastionSubnet\",\"spoke1Name\":\"$Azurespoke1Name\",\"spoke1AddressSpacePrefix\":\"$Azurespoke1AddressSpacePrefix\",\"spoke1Subnet1Prefix\":\"$Azurespoke1Subnet1Prefix\",\"spoke2Name\":\"$Azurespoke2Name\",\"spoke2AddressSpacePrefix\":\"$Azurespoke2AddressSpacePrefix\",\"spoke2Subnet1Prefix\":\"$Azurespoke2Subnet1Prefix\"}
 
@@ -129,15 +138,6 @@ az monitor diagnostic-settings create -n 'toLogAnalytics' \
 --workspace $(az monitor log-analytics workspace show -g $rg --workspace-name $Workspacename --query id -o tsv) \
 --logs '[{"category":"AzureFirewallApplicationRule","Enabled":true}, {"category":"AzureFirewallNetworkRule","Enabled":true}, {"category":"AzureFirewallDnsProxy","Enabled":true}]' \
 --metrics '[{"category": "AllMetrics","enabled": true}]'
-
-### Creating VPN-VNET for Internet breakout
-AzurevpngwName=az-vpn #Azure Spoke 1 name
-AzurevpngwAddressSpacePrefix=10.0.23.0/24 # Azure Spoke 1 VNET address space
-Azurevpngw2Subnet1Prefix=10.0.23.0/27 # Azure Spoke 1 VNET address 
-AzurehubgatewaySubnetPrefix=10.0.23.32/27
-vnetname=$AzurevpngwName-vnet 
-subnetname=subnet1
-nvaname=$AzurevpngwName-nva-lx
 
 # Create VPN vnet and peering to spoke1
 az network vnet create --name $AzurevpngwName-vnet -g $rg --address-prefixes 10.0.23.0/24 --location $location --subnet-name subnet1 --subnet-prefix $Azurevpngw2Subnet1Prefix --output none
@@ -280,6 +280,10 @@ echo OPNsense Public IP: &&\
 az network public-ip show --name provider-opnnva-PublicIP --resource-group $rg -o tsv --query "ipAddress" -o tsv &&\
 echo Shared key: &&\
 echo $sharedkey 
+echo OPNsense ASN: &&\
+echo $onpremasn &&\
+echo VNET VPN Gateway ASN &&\
+echo $asn
 # Add Phase 2 - Mode: Route-based / Local Address: 169.254.0.1 / Remote Address: 169.254.21.1 / Encryption algorithm: AES 256
 # Enable IPSec checkbox and Apply Changes
 # Firewall: Rules:  / Add rule (Plus) / Save / Apply Changes
@@ -288,5 +292,4 @@ echo $sharedkey
 # Routing: BGP / Neighbors tab / Add / Peer-IP 169.254.21.1 / Remote AS 65515 / Send Defaultroute
 # Routing: BGP / General tab / Save
 # Firewall: NAT: Outbound / Add rule (Plus) / Save / Apply Changes
-
 

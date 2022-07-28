@@ -48,12 +48,13 @@ There are three potential solutions for overcome the requirements:
 3) Same as 2 option but no NVA or ARS
 - SNAT traffic over Azure Firewall.
 
-
 ### Solution diagram
 
 The diagram below shows solution 1. The other solutions will be added in the future.
 
 ![](./media/scenario3.png)
+
+Deploy this solution by using 
 
 ### References
 
