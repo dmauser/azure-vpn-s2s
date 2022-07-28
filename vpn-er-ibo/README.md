@@ -1,4 +1,4 @@
-# VPN with ER and Internet Breakout via VPN
+# Internet Breakout with VPN (ER and Azure Firewall scenario)
 
 ### Scenario
 
@@ -28,25 +28,25 @@ However, when using the firewall an UDR is required to send the traffic from On-
 There are three potential solutions for overcome the requirements:
 
 1) Create a new VPN-VNET with VPN Gateway and add NVA to facilitate the routing with Spk1 (AVD) VNET.
-- VNET peering from AVD VNET to VPN-VNET with use remote gateway flag disable on the Spk1 peering side.
-- VNET Peering from AVD VNET to Hub with use remote gateway flag enabled. That will allow Spk1 VNET to get propagated down to ER.
-- On Spk1 (AVD) VNET Configure UDR:
- - Gateway propagation disabled.
- - Default route 0.0.0.0/0 to NVA in the VPN-VNET.
- - Private traffic next hop AzFW.
+   - VNET peering from AVD VNET to VPN-VNET with use remote gateway flag disable on the Spk1 peering side.
+   - VNET Peering from AVD VNET to Hub with use remote gateway flag enabled. That will allow Spk1 VNET to get propagated down to ER.
+   - On Spk1 (AVD) VNET Configure UDR:
+    - Gateway propagation disabled.
+   - Default route 0.0.0.0/0 to NVA in the VPN-VNET.
+   - Private traffic next hop AzFW.
 
 2) Create a new VPN-VNET with VPN Gateway (no NVA needed)
-- VNET peering from AVD VNET to VPN-VNET with use remote gateway flag ENABLED on the Spk1 peering side.
-- VNET Peering from AVD VNET to Hub with use remote gateway flag DISABLED.
-- On Spk1 (AVD) VNET Configure UDR:
- - Gateway propagation enabled. That will allow AVD to learn default route from VPN Gateway in case it is getting propagated by BGP.
-    - For forced tunnel scenario with VPN GW (add link here) you add UDR 0/0 and next hop Virtual Network Gateway
- - VNET to use default route 0.0.0.0/0 to NVA in the VPN-VNET
- - VNET to use private
-- Add NVA + ARS to inject 10.0.21.0/24 to allow ER propagate the route down to On-premises.
+   - VNET peering from AVD VNET to VPN-VNET with use remote gateway flag ENABLED on the Spk1 peering side.
+   - VNET Peering from AVD VNET to Hub with use remote gateway flag DISABLED.
+   - On Spk1 (AVD) VNET Configure UDR:
+   - Gateway propagation enabled. That will allow AVD to learn default route from VPN Gateway in case it is getting propagated by BGP.
+      - For forced tunnel scenario with VPN GW (add link here) you add UDR 0/0 and next hop Virtual Network Gateway
+   - VNET to use default route 0.0.0.0/0 to NVA in the VPN-VNET
+   - VNET to use private
+   - Add NVA + ARS to inject 10.0.21.0/24 to allow ER propagate the route down to On-premises.
 
 3) Same as 2 option but no NVA or ARS
-- SNAT traffic over Azure Firewall.
+   - SNAT traffic over Azure Firewall.
 
 ### Solution diagram
 
@@ -54,7 +54,7 @@ The diagram below shows solution 1. The other solutions will be added in the fut
 
 ![](./media/scenario3.png)
 
-Deploy this solution by using 
+Deploy this solution by using [vpner-ibo-deploy.azcli](https://github.com/dmauser/azure-vpn-s2s/blob/main/vpn-er-ibo/scripts/vpner-ibo-deploy.azcli)
 
 ### References
 
