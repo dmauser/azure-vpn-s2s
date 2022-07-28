@@ -1,0 +1,22 @@
+# Upgrade az-net-vpngw to AZ
+# delete connections
+vpnconn=$(az network vpn-connection list -g $rg --query '[?contains(name,`'az-inet'`)].name' -o tsv)
+az network vpn-connection delete -g $rg --name $vpnconn
+# delet existing
+az network vnet-gateway delete --name $AzurevpngwName-vpngw --resource-group $rg --no-wait
+az network public-ip delete --name $AzurevpngwName-vpngw-pip1 --resource-group $rg
+
+# Deploy VPN Gateway
+gwsize=VpnGw2AZ
+gwgeneration=generation2
+asn=65515
+az network public-ip create --name $AzurevpngwName-vpngw-pip1 --resource-group $rg --sku Standard --zone 1 2 3
+az network vnet-gateway create --name $AzurevpngwName-vpngw --public-ip-address $AzurevpngwName-vpngw-pip1 \
+--resource-group $rg \
+--vnet $AzurevpngwName-vnet  \
+--gateway-type Vpn \
+--vpn-type RouteBased \
+--sku $gwsize \
+--vpn-gateway-generation $gwgeneration \
+--asn $asn \
+--no-wait

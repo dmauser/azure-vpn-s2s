@@ -1,0 +1,23 @@
+# Check ER/VPN GW learned / advertised routes
+# Azure ER
+az network vnet-gateway list-bgp-peer-status -g $rg -n $AzurehubName-ergw -o table
+ips=$(az network vnet-gateway list-bgp-peer-status -g $rg -n $AzurehubName-ergw --query 'value[].{ip:neighbor}' -o tsv)
+array=($ips)
+for ip in "${array[@]}"
+  do
+  echo Advertised routes to peer $ip
+  az network vnet-gateway list-advertised-routes -g $rg -n $AzurehubName-ergw -o table --peer $(az network vnet-gateway list-bgp-peer-status -g $rg -n $AzurehubName-ergw --query 'value[1].{ip:neighbor}' -o tsv)
+  done
+az network vnet-gateway list-learned-routes -g $rg -n $AzurehubName-ergw -o table
+
+# Troubleshooting
+# Disable UDRs ## Disable Route Tables (bypass Firewall) - It restores default behavior of the original LAB without the Firewall.
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $AzurehubName-vnet --route-table "" -o none
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke1Name-vnet --route-table "" -o none
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke2Name-vnet --route-table "" -o none
+az network vnet subnet update -n GatewaySubnet -g $rg --vnet-name $AzurehubName-vnet --route-table "" -o none
+
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $AzurehubName-vnet --route-table RT-Hub-to-AzFW -o none
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke1Name-vnet --route-table RT-Spoke1-to-NVA -o none
+az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke2Name-vnet --route-table RT-Spoke2-to-AzFW -o none
+az network vnet subnet update -n GatewaySubnet -g $rg --vnet-name $AzurehubName-vnet --route-table RT-GWSubnet-to-AzFW -o none

@@ -1,0 +1,15 @@
+# (Optional) ExpressRoute Circuit - This template deploy an ER Circuit at Dallas location using Megaport provider.
+az deployment group create \
+--resource-group $rg \
+--template-uri https://raw.githubusercontent.com/dmauser/azure-hub-spoke-base-lab/main/linked/ercircuit.json \
+--parameters ercircuitname=er-lab-onprem asn=65154 primaryPeerAddressPrefix=172.100.154.0/30 secondaryPeerAddressPrefix=172.100.154.4/30 provider=Megaport peeringlocation="Dallas" bandwidthInMbps=50 \
+--no-wait
+
+# (Optional) Provision Circuit with Provider before proceed with the next step
+# (Optional) Optional Connect both ER Circuit to Hub ExpressRoute Gateway
+
+erid=$(az network express-route show -n er-lab-onprem -g $rg --query id -o tsv) 
+az network vpn-connection create --name connection-to-onprem \
+--resource-group $rg --vnet-gateway1 $AzurehubName-ergw \
+--express-route-circuit2 $erid \
+--routing-weight 0

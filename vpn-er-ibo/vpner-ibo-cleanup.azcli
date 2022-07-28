@@ -1,0 +1,17 @@
+# Clean up
+
+#GCP
+# Cleanup
+gcloud compute interconnects attachments delete $envname-vlan --region $region --quiet 
+gcloud compute routers delete $envname-router --project=$project --region=$region --quiet
+gcloud compute instances delete $envname-vm1 --project=$project --zone=$zone --quiet
+gcloud compute firewall-rules delete $envname-allow-traffic-from-azure --quiet
+gcloud compute networks subnets delete $envname-subnet --project=$project --region=$region --quiet
+gcloud compute networks delete $envname-vpc --project=$project --quiet
+
+# Parameters 
+#set resource group
+rg=lab-er-vpn-s2s-Internet 
+
+### Clean up
+az group delete -g $rg --no-wait 
