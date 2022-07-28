@@ -259,7 +259,12 @@ else
         sleep 5
     done
 fi
-# Create VPN Gateway connection to On-Premises
+
+# Adding Custom BGP Address APIPA
+echo Adding Custom BGP Address APIPA
+az network vnet-gateway update --name $AzurevpngwName-vpngw --resource-group $rg --set bgpSettings.bgpPeeringAddresses[0].customBgpIpAddresses=[\"169.254.21.1\"] 
+# Creating VPN Gateway connection to On-Premises
+echo Creating VPN Gateway connection to On-Premises
 az network vpn-connection create --name $AzurevpngwName-to-$onpremname \
 --resource-group $rg \
 --vnet-gateway1 $AzurevpngwName-vpngw \
