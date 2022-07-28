@@ -44,6 +44,100 @@ az deployment group create --name lab-$RANDOM --resource-group $rg \
 --parameters Restrict_SSH_VM_AccessByPublicIP=$mypip sharedKey=$sharedkey deployHubERGateway=true Azure=$JsonAzure VmAdminUsername=$username VmAdminPassword=$password \
 --no-wait
 
+
+# Deploying OPNsense NVA1 on the Provider (emulate ISaaS Provider side)
+echo "Deploying OPNsense NVA1 on the Provider (emulate ISaaS Provider side)"
+ShellScriptName=configureopnsense.sh
+scenarioOption="TwoNics"
+virtualMachineSize=Standard_B2s
+virtualMachineName=provider-opnnva
+virtualNetworkName=provider-vnet
+existingvirtualNetwork=new
+VNETAddress=172.16.0.0/24 
+UntrustedSubnetCIDR=172.16.0.0/28
+TrustedSubnetCIDR=172.16.0.16/28
+existingUntrustedSubnetName=untrusted
+existingTrustedSubnetName=trusted
+
+az vm image terms accept --urn thefreebsdfoundation:freebsd-13_0:13_0-release:13.0.0 -o none
+az deployment group create --name provider-nva-$RANDOM --resource-group $rg \
+--template-uri "https://raw.githubusercontent.com/dmauser/opnazure/master/ARM/main.json" \
+--parameters scenarioOption=$scenarioOption virtualMachineName=$virtualMachineName virtualMachineSize=$virtualMachineSize existingvirtualNetwork=$existingvirtualNetwork VNETAddress="[\"$VNETAddress\"]" virtualNetworkName=$virtualNetworkName UntrustedSubnetCIDR=$UntrustedSubnetCIDR TrustedSubnetCIDR=$TrustedSubnetCIDR existingUntrustedSubnetName=$existingUntrustedSubnetName existingTrustedSubnetName=$existingTrustedSubnetName Location=$location \
+--no-wait
+
+### Adding Azure Firewall in the Azure Hub:
+echo Adding Azure Firewall in the Azure Hub:
+
+#Building Azure Firewall Note this section takes few minutes to complete.
+echo Building Azure Firewall / Note this section takes few minutes to complete.
+az network public-ip create --name $AzurehubName-azfw-pip --resource-group $rg --location $location --allocation-method static --sku standard --output none
+az network firewall create --name $AzurehubName-azfw --resource-group $rg --location $location --output none
+az network firewall ip-config create --firewall-name $AzurehubName-azfw --name FW-config --public-ip-address $AzurehubName-azfw-pip  --resource-group $rg --vnet-name $AzurehubName-vnet --output none
+az network firewall update --name $AzurehubName-azfw --resource-group $rg --output none
+
+#Creating firewall rule to allow all traffic
+echo Creating firewall rule to allow all traffic
+az network firewall network-rule create --resource-group $rg \
+--firewall-name $AzurehubName-azfw \
+--collection-name azfw-rules \
+--priority 1000 \
+--action Allow \
+--name Allow-All \
+--protocols Any \
+--source-addresses "*" \
+--destination-addresses "*" \
+--destination-ports "*"
+
+#Creating Log Analytics Workspace
+echo Creating Log Analytics Workspace
+Workspacename=$AzurehubName-Firewall-Logs 
+az monitor log-analytics workspace create -g $rg --workspace-name $Workspacename --location $location --no-wait
+
+#Enabling Azure Firewall diagnostics
+echo Enabling Azure Firewall diagnostics
+az monitor diagnostic-settings create -n 'toLogAnalytics' \
+--resource $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query id -o tsv) \
+--workspace $(az monitor log-analytics workspace show -g $rg --workspace-name $Workspacename --query id -o tsv) \
+--logs '[{"category":"AzureFirewallApplicationRule","Enabled":true}, {"category":"AzureFirewallNetworkRule","Enabled":true}, {"category":"AzureFirewallDnsProxy","Enabled":true}]' \
+--metrics '[{"category": "AllMetrics","enabled": true}]'
+
+# Creating VPN vnet and peering it to the spoke1
+echo Creating VPN vnet and peering it to the spoke1
+az network vnet create --name $AzurevpngwName-vnet -g $rg --address-prefixes 10.0.23.0/24 --location $location --subnet-name subnet1 --subnet-prefix $Azurevpngw2Subnet1Prefix --output none
+az network vnet subnet create --address-prefix $AzurehubgatewaySubnetPrefix --name GatewaySubnet -g $rg --vnet-name $AzurevpngwName-vnet --output none
+
+# Building VNET peering
+echo Building VNET peering
+az network vnet peering create -g $rg -n inet-to-spoke1 --vnet-name $AzurevpngwName-vnet --allow-vnet-access --allow-forwarded-traffic --remote-vnet $(az network vnet show -g $rg --name $Azurespoke1Name-vnet --query id --out tsv) -o none
+az network vnet peering create -g $rg -n spoke1-to-inet --vnet- $Azurespoke1Name-vnet --allow-vnet-access --allow-forwarded-traffic --remote-vnet $(az network vnet show -g $rg -n $AzurevpngwName-vnet --query id --out tsv) -o none
+
+# Deploying VPN Gateway
+echo Deploying VPN Gateway at the $AzurevpngwName-vnet
+gwsize=VpnGw1
+asn=65023
+az network public-ip create --name $AzurevpngwName-vpngw-pip1 --resource-group $rg --sku Basic
+az network vnet-gateway create --name $AzurevpngwName-vpngw --public-ip-address $AzurevpngwName-vpngw-pip1 \
+--resource-group $rg \
+--vnet $AzurevpngwName-vnet  \
+--gateway-type Vpn \
+--vpn-type RouteBased \
+--sku $gwsize \
+--asn $asn \
+--no-wait
+
+
+### Deploying NVA on the VPN-VNET to facilitate Internet Breakout via VPN and Provider
+echo Deploying NVA on the VPN-VNET to facilitate Internet Breakout via VPN and Provider
+# NVA + Config script to enable NAT
+az network public-ip create --name $nvaname-pip --resource-group $rg --location $location --allocation-method Dynamic -o none
+az network nic create --name $nvaname-nic --resource-group $rg --subnet $subnetname --vnet $vnetname --public-ip-address $nvaname-pip --ip-forwarding true -o none
+az vm create --resource-group $rg --location $location --name $nvaname --size Standard_B1s --nics $nvaname-nic  --image UbuntuLTS --admin-username $username --admin-password $password -o none
+# Enable routing and NAT on Linux NVA:
+scripturi="https://raw.githubusercontent.com/dmauser/AzureVM-Router/master/linuxrouter.sh"
+az vm extension set --resource-group $rg --vm-name $nvaname  --name customScript --publisher Microsoft.Azure.Extensions \
+--protected-settings "{\"fileUris\": [\"$scripturi\"],\"commandToExecute\": \"./linuxrouter.sh\"}" \
+--no-wait`
+
 #Check VMs deployment status
 echo Check VMs deployment status...
 for vm in $(az vm list -g $rg --query [].name -o tsv)
@@ -67,15 +161,14 @@ done
 echo Enable boot diagnostics for all VMs in the resource group (Serial console)
 #Enable boot diagnostics for all VMs in the resource group (Serial console)
 let "randomIdentifier=$RANDOM*$RANDOM" #used to create unique storage account name.
-#Create Storage Account (boot diagnostics + serial console)
+#Creating Storage Account (boot diagnostics + serial console)
 az storage account create -n sc$randomIdentifier -g $rg -l $location --sku Standard_LRS -o none
 #Enable boot diagnostics
 stguri=$(az storage account show -n sc$randomIdentifier -g $rg --query primaryEndpoints.blob -o tsv)
 az vm boot-diagnostics enable --storage $stguri --ids $(az vm list -g $rg --query "[].id" -o tsv) -o none
 
-echo Installing tools for networking connectivity validation 
-### Installing tools for networking connectivity validation such as traceroute, tcptraceroute, iperf and others (check link below for more details) 
-echo Installing tools for networking connectivity validation such as traceroute, tcptraceroute, iperf and others  
+### Installing network tools on all VMs  (traceroute, tcptraceroute, iperf and others)  
+echo "Installing network tools on all VMs (traceroute, tcptraceroute, iperf and others)"
 nettoolsuri="https://raw.githubusercontent.com/dmauser/azure-vm-net-tools/main/script/nettools.sh"
 for vm in `az vm list -g $rg --query "[?storageProfile.imageReference.offer=='UbuntuServer'].name" -o tsv`
 do
@@ -88,94 +181,14 @@ do
  --no-wait
 done
 
-echo Deploying OPNsense NVA1 on the Provider (this is to emulate ISaaS Provider side)
-# Deploying OPNsense NVA1 on the Provider (this is to emulate ISaaS Provider side)
-ShellScriptName=configureopnsense.sh
-scenarioOption="TwoNics"
-virtualMachineSize=Standard_B2s
-virtualMachineName=provider-opnnva
-virtualNetworkName=provider-vnet
-existingvirtualNetwork=new
-VNETAddress=172.16.0.0/24 
-UntrustedSubnetCIDR=172.16.0.0/28
-TrustedSubnetCIDR=172.16.0.16/28
-existingUntrustedSubnetName=untrusted
-existingTrustedSubnetName=trusted
 
-az vm image terms accept --urn thefreebsdfoundation:freebsd-13_0:13_0-release:13.0.0 -o none
-az deployment group create --name provider-nva-$RANDOM --resource-group $rg \
---template-uri "https://raw.githubusercontent.com/dmauser/opnazure/master/ARM/main.json" \
---parameters scenarioOption=$scenarioOption virtualMachineName=$virtualMachineName virtualMachineSize=$virtualMachineSize existingvirtualNetwork=$existingvirtualNetwork VNETAddress="[\"$VNETAddress\"]" virtualNetworkName=$virtualNetworkName UntrustedSubnetCIDR=$UntrustedSubnetCIDR TrustedSubnetCIDR=$TrustedSubnetCIDR existingUntrustedSubnetName=$existingUntrustedSubnetName existingTrustedSubnetName=$existingTrustedSubnetName Location=$location \
---no-wait
-
-### Add Azure Firewall in the Azure Hub:
-
-#Build Azure Firewall / Note this section takes few minutes to complete.
-az network public-ip create --name $AzurehubName-azfw-pip --resource-group $rg --location $location --allocation-method static --sku standard --output none
-az network firewall create --name $AzurehubName-azfw --resource-group $rg --location $location --output none
-az network firewall ip-config create --firewall-name $AzurehubName-azfw --name FW-config --public-ip-address $AzurehubName-azfw-pip  --resource-group $rg --vnet-name $AzurehubName-vnet --output none
-az network firewall update --name $AzurehubName-azfw --resource-group $rg --output none
-
-#Create firewall rule to allow all traffic
-az network firewall network-rule create --resource-group $rg \
---firewall-name $AzurehubName-azfw \
---collection-name azfw-rules \
---priority 1000 \
---action Allow \
---name Allow-All \
---protocols Any \
---source-addresses "*" \
---destination-addresses "*" \
---destination-ports "*"
-
-#Create Log Analytics Workspace
-Workspacename=$AzurehubName-Firewall-Logs 
-az monitor log-analytics workspace create -g $rg --workspace-name $Workspacename --location $location --no-wait
-
-#Enable Azure Firewall diagnostics
-az monitor diagnostic-settings create -n 'toLogAnalytics' \
---resource $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query id -o tsv) \
---workspace $(az monitor log-analytics workspace show -g $rg --workspace-name $Workspacename --query id -o tsv) \
---logs '[{"category":"AzureFirewallApplicationRule","Enabled":true}, {"category":"AzureFirewallNetworkRule","Enabled":true}, {"category":"AzureFirewallDnsProxy","Enabled":true}]' \
---metrics '[{"category": "AllMetrics","enabled": true}]'
-
-# Create VPN vnet and peering to spoke1
-az network vnet create --name $AzurevpngwName-vnet -g $rg --address-prefixes 10.0.23.0/24 --location $location --subnet-name subnet1 --subnet-prefix $Azurevpngw2Subnet1Prefix --output none
-az network vnet subnet create --address-prefix $AzurehubgatewaySubnetPrefix --name GatewaySubnet -g $rg --vnet-name $AzurevpngwName-vnet --output none
-
-#Build VNET peering # 
-az network vnet peering create -g $rg -n inet-to-spoke1 --vnet-name $AzurevpngwName-vnet --allow-vnet-access --allow-forwarded-traffic --remote-vnet $(az network vnet show -g $rg --name $Azurespoke1Name-vnet --query id --out tsv) -o none
-az network vnet peering create -g $rg -n spoke1-to-inet --vnet- $Azurespoke1Name-vnet --allow-vnet-access --allow-forwarded-traffic --remote-vnet $(az network vnet show -g $rg -n $AzurevpngwName-vnet --query id --out tsv) -o none
-
-# Deploy VPN Gateway
-gwsize=VpnGw1
-asn=65023
-az network public-ip create --name $AzurevpngwName-vpngw-pip1 --resource-group $rg --sku Basic
-az network vnet-gateway create --name $AzurevpngwName-vpngw --public-ip-address $AzurevpngwName-vpngw-pip1 \
---resource-group $rg \
---vnet $AzurevpngwName-vnet  \
---gateway-type Vpn \
---vpn-type RouteBased \
---sku $gwsize \
---asn $asn \
---no-wait
-
-### DeployNVA on the VPN-VNET dedicated for Internet Breakout.
-# NVA + Config script to enable NAT
-
-az network public-ip create --name $nvaname-pip --resource-group $rg --location $location --allocation-method Dynamic -o none
-az network nic create --name $nvaname-nic --resource-group $rg --subnet $subnetname --vnet $vnetname --public-ip-address $nvaname-pip --ip-forwarding true -o none
-az vm create --resource-group $rg --location $location --name $nvaname --size Standard_B1s --nics $nvaname-nic  --image UbuntuLTS --admin-username $username --admin-password $password -o none
-# Enable routing and NAT on Linux NVA:
-scripturi="https://raw.githubusercontent.com/dmauser/AzureVM-Router/master/linuxrouter.sh"
-az vm extension set --resource-group $rg --vm-name $nvaname  --name customScript --publisher Microsoft.Azure.Extensions \
---protected-settings "{\"fileUris\": [\"$scripturi\"],\"commandToExecute\": \"./linuxrouter.sh\"}" \
---no-wait
-
-# UDRs - Spoke1 (AVD) / Spoke2 (Regular VNET)
+# UDRs for Spoke1 (AVD) / Spoke2 (Regular VNET)
+echo "UDRs for Spoke1 (AVD) / Spoke2 (Regular VNET)"
 
 ## Spoke 1 uses Internet VNET NVA and private traffic to Azure Firewall
-## Create UDR + Disable BGP Propagation
+echo Spoke 1 uses Internet VNET NVA and private traffic to Azure Firewall
+## Creating UDR + Disable BGP Propagation
+echo Creating UDR + Disable BGP Propagation
 az network route-table create --name RT-Spoke1-to-NVA  --resource-group $rg --location $location --disable-bgp-route-propagation true -o none
 ## Default route to NVA
 az network route-table route create --resource-group $rg --name Default-to-NVA --route-table-name RT-Spoke1-to-NVA   \
@@ -206,8 +219,9 @@ az network route-table route create --resource-group $rg --name Exception --rout
 --address-prefix $mypip/32 \
 --next-hop-type Internet
 
-## Spoke 2 uses AzureFirewall for both Internet and Private traffic 
-## Create UDR + Disable BGP Propagation
+## Spoke 2 uses AzureFirewall for both Internet and Private traffic
+echo Spoke 2 uses AzureFirewall for both Internet and Private traffic 
+## Creating UDR + Disable BGP Propagation
 az network route-table create --name RT-Spoke2-to-AzFW  --resource-group $rg --location $location --disable-bgp-route-propagation true
 ## Default route to AzFW
 az network route-table route create --resource-group $rg --name Default-to-AzFw --route-table-name RT-Spoke2-to-AzFW   \
@@ -225,12 +239,43 @@ az network route-table route create --resource-group $rg --name Exception --rout
 --address-prefix $mypip/32 \
 --next-hop-type Internet
 
-# Apply UDRs to Spk1 and Spk2 VNETs
+# Applying UDRs to Spk1 and Spk2 VNETs
+echo Applying UDRs to Spk1 and Spk2 VNETs
 az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke1Name-vnet --route-table RT-Spoke1-to-NVA
 az network vnet subnet update -n subnet1 -g $rg --vnet-name $Azurespoke2Name-vnet --route-table RT-Spoke2-to-AzFW
 
-# Create VPN Connection from VPN-VNET to OPNSense
-# Create Local Network Gateway with OnPrem info
+#UDR to send traffic between ExpressRoute environment and VPN Onprem and between Hub and spoke via Azure Firewall
+az network route-table create --name RT-GWSubnet-to-AzFW --resource-group $rg --location $location 
+## Azure Hub Subnet 1
+az network route-table route create --resource-group $rg --name HubSubnet1-to-AzFw --route-table-name RT-GWSubnet-to-AzFW \
+--address-prefix $Azurehubsubnet1Prefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Azure Spoke 1
+az network route-table route create --resource-group $rg --name Spoke1-to-AzFw --route-table-name RT-GWSubnet-to-AzFW \
+--address-prefix $Azurespoke1AddressSpacePrefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Azure Spoke 2
+az network route-table route create --resource-group $rg --name Spok2-to-AzFw --route-table-name RT-GWSubnet-to-AzFW \
+--address-prefix $Azurespoke2AddressSpacePrefix \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $(az network firewall show --name $AzurehubName-azfw --resource-group $rg --query "ipConfigurations[].privateIpAddress" -o tsv)
+## Associating RT-to-GWSubnet to GatewaySubnet
+az network vnet subnet update -n GatewaySubnet -g $rg --vnet-name $AzurehubName-vnet --route-table RT-GWSubnet-to-AzFW
+
+# AzureFireawll Subnet -> Default route - NextHop Internet
+az network route-table create --name RT-AzFW-to-Internet  --resource-group $rg --location $location --disable-bgp-route-propagation false
+## Default route to AzFW
+az network route-table route create --resource-group $rg --name Default-to-AzFw --route-table-name RT-AzFW-to-Internet   \
+--address-prefix 0.0.0.0/0 \
+--next-hop-type Internet 
+az network vnet subnet update -n AzureFirewallSubnet -g $rg --vnet-name $AzurehubName-vnet --route-table RT-AzFW-to-Internet
+
+
+# Creating VPN Connection from VPN-VNET to OPNSense
+echo Creating VPN Connection from VPN-VNET to OPNSense
+# Creating Local Network Gateway with OnPrem info
 onpremname=provider-opnnva
 onpremasn=65172
 onprembgpaddr=169.254.0.1
@@ -241,8 +286,9 @@ az network local-gateway create --gateway-ip-address $(az network public-ip show
 --bgp-peering-address $onprembgpaddr \
 --output none
 
-# Check provisioning status and create VPN connection
-#Branches VPN Gateways provisioning status
+# Checking  VPN Gateway provisioning status and create VPN connection
+# VPN Gateways provisioning status
+echo VPN Gateways provisioning status
 prState=$(az network vnet-gateway show -g $rg -n $AzurevpngwName-vpngw --query provisioningState -o tsv)
 if [[ $prState == 'Failed' ]];
 then
@@ -260,7 +306,7 @@ else
     done
 fi
 
-# Adding Custom BGP Address APIPA
+# Adding Custom BGP Address APIPA to VPN Gateway
 echo Adding Custom BGP Address APIPA
 az network vnet-gateway update --name $AzurevpngwName-vpngw --resource-group $rg --set bgpSettings.bgpPeeringAddresses[0].customBgpIpAddresses=[\"169.254.21.1\"] 
 # Creating VPN Gateway connection to On-Premises
@@ -284,11 +330,15 @@ az network vnet-gateway show -n $AzurevpngwName-vpngw -g $rg  --query bgpSetting
 echo OPNsense Public IP: &&\
 az network public-ip show --name provider-opnnva-PublicIP --resource-group $rg -o tsv --query "ipAddress" -o tsv &&\
 echo Shared key: &&\
-echo $sharedkey 
+echo $sharedkey  &&\
 echo OPNsense ASN: &&\
 echo $onpremasn &&\
 echo VNET VPN Gateway ASN &&\
-echo $asn
+echo $asn &&\
+echo BGP Peer Address: &&\
+echo OPNSense BGP IP: $onprembgpaddr &&\
+echo VPN Gateway BGP IP: $(az network vnet-gateway show -n $AzurevpngwName-vpngw -g $rg  --query bgpSettings.bgpPeeringAddresses[0].customBgpIpAddresses -o tsv)
+
 # Add Phase 2 - Mode: Route-based / Local Address: 169.254.0.1 / Remote Address: 169.254.21.1 / Encryption algorithm: AES 256
 # Enable IPSec checkbox and Apply Changes
 # Firewall: Rules:  / Add rule (Plus) / Save / Apply Changes
