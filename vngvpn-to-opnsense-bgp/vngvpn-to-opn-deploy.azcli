@@ -1,0 +1,68 @@
+#Azure Variables
+rg=lab-ervpn-opn #Define your resource group
+location=centralus #Set Region
+mypip=$(curl -4 ifconfig.io -s) #Captures your local Public IP and adds it to NSG to restrict access to SSH only for your Public IP.
+sharedkey=$(openssl rand -base64 24) #VPN Gateways S2S shared key is automatically generated.
+username=azureuser
+password=Msft123Msft123
+
+#Define parameters for Azure Hub and Spokes:
+AzurehubName=Az-Hub #Azure Hub Name
+AzurehubaddressSpacePrefix=10.0.20.0/24 #Azure Hub VNET address space
+AzurehubNamesubnetName=subnet1 #Azure Hub Subnet name where VM will be provisioned
+Azurehubsubnet1Prefix=10.0.20.0/27 #Azure Hub Subnet address prefix
+AzurehubgatewaySubnetPrefix=10.0.20.32/27 #Azure Hub Gateway Subnet address prefix
+AzureFirewallPrefix=10.0.20.64/26 #Azure Firewall Prefix
+AzurehubrssubnetPrefix=10.0.20.128/27 #Azure Hub Route Server subnet address prefix
+AzureHubDnsInSubnetPrefix=10.0.20.160/28
+AzureHubDnsOutSubnetPrefix=10.0.20.176/28
+AzureHubBastionSubnet=10.0.20.192/26
+Azurespoke1Name=Az-Spk1 #Azure Spoke 1 name
+Azurespoke1AddressSpacePrefix=10.0.21.0/24 # Azure Spoke 1 VNET address space
+Azurespoke1Subnet1Prefix=10.0.21.0/27 # Azure Spoke 1 Subnet1 address prefix
+Azurespoke2Name=Az-Spk2 #Azure Spoke 1 name
+Azurespoke2AddressSpacePrefix=10.0.22.0/24 # Azure Spoke 1 VNET address space
+Azurespoke2Subnet1Prefix=10.0.22.0/27 # Azure Spoke 1 VNET address space
+
+#Parsing parameters above in Json format (do not change)
+JsonAzure={\"hubName\":\"$AzurehubName\",\"addressSpacePrefix\":\"$AzurehubaddressSpacePrefix\",\"subnetName\":\"$AzurehubNamesubnetName\",\"subnet1Prefix\":\"$Azurehubsubnet1Prefix\",\"AzureFirewallPrefix\":\"$AzureFirewallPrefix\",\"gatewaySubnetPrefix\":\"$AzurehubgatewaySubnetPrefix\",\"rssubnetPrefix\":\"$AzurehubrssubnetPrefix\",\"bastionSubnetPrefix\":\"$AzureHubBastionSubnet\",\"spoke1Name\":\"$Azurespoke1Name\",\"spoke1AddressSpacePrefix\":\"$Azurespoke1AddressSpacePrefix\",\"spoke1Subnet1Prefix\":\"$Azurespoke1Subnet1Prefix\",\"spoke2Name\":\"$Azurespoke2Name\",\"spoke2AddressSpacePrefix\":\"$Azurespoke2AddressSpacePrefix\",\"spoke2Subnet1Prefix\":\"$Azurespoke2Subnet1Prefix\"}
+
+#Deploy base lab environment = Hub + VPN Gateway + VM and two Spokes with one VM on each.
+echo Deploying base lab: Hub with Spoke1 and 2 and ExpressRoute Gateway...
+az group create --name $rg --location $location --output none
+az deployment group create --name lab-$RANDOM --resource-group $rg \
+--template-uri https://raw.githubusercontent.com/dmauser/azure-vpn-s2s/main/vpn-er-ibo/template/azurehubspoke.json \
+--parameters Restrict_SSH_VM_AccessByPublicIP=$mypip deployHubVPNGateway=true sharedKey=$sharedkey deployHubERGateway=true Azure=$JsonAzure VmAdminUsername=$username VmAdminPassword=$password \
+--no-wait
+
+# Deploying OPNsense NVA1 on the on-prem (emulate ISaaS on-prem side)
+echo "Deploying OPNsense NVA1 on the on-prem (emulate ISaaS on-prem side)"
+ShellScriptName=configureopnsense.sh
+scenarioOption="TwoNics"
+virtualMachineSize=Standard_B2s
+virtualMachineName=on-prem-opnnva
+virtualNetworkName=on-prem-vnet
+existingvirtualNetwork=new
+VNETAddress=192.168.100.0/24 
+UntrustedSubnetCIDR=192.168.100.0/28
+TrustedSubnetCIDR=192.168.100.16/28
+existingUntrustedSubnetName=untrusted
+existingTrustedSubnetName=trusted
+
+az vm image terms accept --urn thefreebsdfoundation:freebsd-13_0:13_0-release:13.0.0 -o none
+az deployment group create --name on-prem-nva-$RANDOM --resource-group $rg \
+--template-uri "https://raw.githubusercontent.com/dmauser/opnazure/master/ARM/main.json" \
+--parameters scenarioOption=$scenarioOption virtualMachineName=$virtualMachineName virtualMachineSize=$virtualMachineSize existingvirtualNetwork=$existingvirtualNetwork VNETAddress="[\"$VNETAddress\"]" virtualNetworkName=$virtualNetworkName UntrustedSubnetCIDR=$UntrustedSubnetCIDR TrustedSubnetCIDR=$TrustedSubnetCIDR existingUntrustedSubnetName=$existingUntrustedSubnetName existingTrustedSubnetName=$existingTrustedSubnetName Location=$location \
+--no-wait
+
+# Create ER Circuit
+az network express-route create --name $AzurehubName-ercircuit --bandwidth 50 --peering-location "Dallas" -g $rg --provider "Megaport" -l $location --sku-family MeteredData --sku-tier Standard
+
+# Connect OnPrem ER Circuit to vHub.
+# NOTE: provision your ER Circuit with provider before connecting to the vHub
+peering=$(az network express-route show -g $rg --name $eronprem --query peerings[].id -o tsv)
+az network express-route gateway connection create --name Connection-to-$eronprem -g $rg --gateway-name $hubname-ergw --peering $peering --associated-route-table $routetableid  --propagated-route-tables $routetableid --labels default
+
+# VPN Connection
+
+
