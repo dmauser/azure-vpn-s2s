@@ -83,7 +83,10 @@ az network route-table route create --resource-group $rg --name exception-to-pip
 
 # Create Subnet 1 and Linux VM
 az network vnet subnet create -g $rg --vnet-name $virtualNetworkName -n subnet1 --address-prefixes $vmsubnet --output none --nsg $location-default-nsg --route-table onprem-to-nva-udr 
-az vm create -n on-prem-lxvm1 -g $rg --image ubuntults --public-ip-sku Standard --size $virtualMachineSize -l $location --subnet subnet1 --vnet-name $virtualNetworkName --admin-username $username --admin-password $password --nsg "" --no-wait
+az vm create -n on-prem-lxvm1 -g $rg --image ubuntults --public-ip-sku Standard --size $virtualMachineSize -l $location --subnet subnet1 --vnet-name $virtualNetworkName --admin-username $username --admin-password $password --nsg "" --no-wait 
+# Enable Boot Diagnostics
+az vm boot-diagnostics enable --ids $(az vm list -g $rg --query "[].id" -o tsv) -o none 
+
 
 # Create ER Circuit
 az network express-route create --name $AzurehubName-ercircuit --bandwidth 50 --peering-location "Dallas" -g $rg --provider "Megaport" -l $location --sku-family MeteredData --sku-tier Standard
