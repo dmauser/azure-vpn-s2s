@@ -32,7 +32,7 @@ echo Deploying base lab: Hub with Spoke1 and 2 and ExpressRoute Gateway...
 az group create --name $rg --location $location --output none
 az deployment group create --name lab-$RANDOM --resource-group $rg \
 --template-uri https://raw.githubusercontent.com/dmauser/azure-vpn-s2s/main/vpn-er-ibo/template/azurehubspoke.json \
---parameters Restrict_SSH_VM_AccessByPublicIP=$mypip deployHubVPNGateway=true sharedKey=$sharedkey deployHubERGateway=true Azure=$JsonAzure VmAdminUsername=$username VmAdminPassword=$password \
+--parameters Restrict_SSH_VM_AccessByPublicIP=$mypip deployHubVPNGateway=true enableBgp=true sharedKey=$sharedkey deployHubERGateway=true Azure=$JsonAzure VmAdminUsername=$username VmAdminPassword=$password \
 --no-wait
 
 # Deploying OPNsense NVA1 on the on-prem (emulate ISaaS on-prem side)
@@ -46,6 +46,7 @@ existingvirtualNetwork=new
 VNETAddress=192.168.100.0/24 
 UntrustedSubnetCIDR=192.168.100.0/28
 TrustedSubnetCIDR=192.168.100.16/28
+vmsubnet=192.168.100.32/27
 existingUntrustedSubnetName=untrusted
 existingTrustedSubnetName=trusted
 
@@ -55,14 +56,89 @@ az deployment group create --name on-prem-nva-$RANDOM --resource-group $rg \
 --parameters scenarioOption=$scenarioOption virtualMachineName=$virtualMachineName virtualMachineSize=$virtualMachineSize existingvirtualNetwork=$existingvirtualNetwork VNETAddress="[\"$VNETAddress\"]" virtualNetworkName=$virtualNetworkName UntrustedSubnetCIDR=$UntrustedSubnetCIDR TrustedSubnetCIDR=$TrustedSubnetCIDR existingUntrustedSubnetName=$existingUntrustedSubnetName existingTrustedSubnetName=$existingTrustedSubnetName Location=$location \
 --no-wait
 
+# Check On-prem VNET status:
+echo VNET provisioning status
+prState=''
+while [[ $prState != 'Succeeded' ]];
+ do
+    prState=$(az network vnet show -n $virtualNetworkName -g $rg --query provisioningState -o tsv)
+    echo "$virtualNetworkName provisioningState="$prState
+    sleep 5
+done
+
+# Create UDR next-hop NVA:
+opnintip=$(az network nic show -n on-prem-nva-Trusted-NIC -g $rg --query 'ipConfigurations[0].privateIpAddress' -o tsv)
+## Creating UDR + Disable BGP Propagation
+az network route-table create --name onprem-to-nva-udr  --resource-group $rg --location $location --disable-bgp-route-propagation true --output none
+## Default route to NVA
+az network route-table route create --resource-group $rg --name default-to-nva --route-table-name  onprem-to-nva-udr  \
+--address-prefix 0.0.0.0/0 \
+--next-hop-type VirtualAppliance \
+--next-hop-ip-address $opnintip \
+--output none
+az network route-table route create --resource-group $rg --name exception-to-pip --route-table-name  onprem-to-nva-udr  \
+--address-prefix $mypip/32 \
+--next-hop-type Internet 
+--output none
+
+# Create Subnet 1 and Linux VM
+az network vnet subnet create -g $rg --vnet-name $virtualNetworkName -n subnet1 --address-prefixes $vmsubnet --output none --nsg $location-default-nsg --route-table onprem-to-nva-udr 
+az vm create -n on-prem-lxvm1 -g $rg --image ubuntults --public-ip-sku Standard --size $virtualMachineSize -l $location --subnet subnet1 --vnet-name $virtualNetworkName --admin-username $username --admin-password $password --nsg "" --no-wait
+
 # Create ER Circuit
-az network express-route create --name $AzurehubName-ercircuit --bandwidth 50 Mpbs --peering-location "Dallas" -g $rg --provider "Megaport" -l $location --sku-family MeteredData --sku-tier Standard
+az network express-route create --name $AzurehubName-ercircuit --bandwidth 50 --peering-location "Dallas" -g $rg --provider "Megaport" -l $location --sku-family MeteredData --sku-tier Standard
 
 # Connect OnPrem ER Circuit to vHub.
 # NOTE: provision your ER Circuit with provider before connecting to the vHub
-peering=$(az network express-route show -g $rg --name $eronprem --query peerings[].id -o tsv)
-az network express-route gateway connection create --name Connection-to-$eronprem -g $rg --gateway-name $hubname-ergw --peering $peering --associated-route-table $routetableid  --propagated-route-tables $routetableid --labels default
+peering=$(az network express-route show -g $rg --name $AzurehubName-ercircuit --query id -o tsv)
+az network vpn-connection create --name Connection-to-$AzurehubName-ercircuit --resource-group $rg --vnet-gateway1 $AzurehubName-ergw --express-route-circuit2 $peering --routing-weight 0
 
-# VPN Connection
+# VPN Connection to OPNSense:
+
+# Creating VPN Connection from VPN-VNET to OPNSense
+echo Creating VPN Connection from VPN-VNET to OPNSense
+# Creating Local Network Gateway with OnPrem info
+onpremname=on-prem-nva
+onpremasn=65010
+onprembgpaddr=169.254.0.1
+az network local-gateway create --gateway-ip-address $(az network public-ip show --name on-prem-nva-PublicIP --resource-group $rg -o tsv --query "ipAddress" -o tsv) \
+--name $AzurehubName-lng-$onpremname \
+--resource-group $rg \
+--asn $onpremasn \
+--bgp-peering-address $onprembgpaddr \
+--output none
+
+# Creating VPN Gateway connection to On-Premises
+echo Creating VPN Gateway connection to On-Premises
+az network vpn-connection create --name $AzurehubName-to-$onpremname \
+--resource-group $rg \
+--vnet-gateway1 $AzurehubName-vpngw \
+-l $location \
+--shared-key $sharedkey \
+--local-gateway2 $AzurehubName-lng-$onpremname \
+--enable-bgp \
+--output none
+
+#Enable boot diagnostics for all VMs in the resource group (Serial console)
+let "randomIdentifier=$RANDOM*$RANDOM" #used to create unique storage account name.
+#Create Storage Account (boot diagnostics + serial console)
+az storage account create -n sc$randomIdentifier -g $rg -l $location --sku Standard_LRS -o none
+#Enable boot diagnostics
+stguri=$(az storage account show -n sc$randomIdentifier -g $rg --query primaryEndpoints.blob -o tsv)
+az vm boot-diagnostics enable --storage $stguri --ids $(az vm list -g $rg --query "[].id" -o tsv) -o none
+
+echo Installing tools for networking connectivity validation such as traceroute, tcptraceroute, iperf and others  
+nettoolsuri="https://raw.githubusercontent.com/dmauser/azure-vm-net-tools/main/script/nettools.sh"
+for vm in `az vm list -g $rg --query "[?storageProfile.imageReference.offer=='UbuntuServer'].name" -o tsv`
+do
+ az vm extension set \
+ --resource-group $rg \
+ --vm-name $vm \
+ --name customScript \
+ --publisher Microsoft.Azure.Extensions \
+ --protected-settings "{\"fileUris\": [\"$nettoolsuri\"],\"commandToExecute\": \"./nettools.sh\"}" \
+ --no-wait
+done
+
 
 
