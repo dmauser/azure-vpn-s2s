@@ -58,5 +58,5 @@ Deploy this solution by using [vpner-ibo-deploy.azcli](https://github.com/dmause
 
 ### References
 
-Prima Access - Onboard an Azure Virtual Network
+Prisma Access - Onboard an Azure Virtual Network
 - https://docs.paloaltonetworks.com/prisma/prisma-access/prisma-access-panorama-integration/secure-your-public-cloud-deployment-with-prisma-access/onboard-azure-vnet
